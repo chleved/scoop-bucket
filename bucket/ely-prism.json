@@ -1,18 +1,19 @@
 {
     "version": "10.0.5",
-    "description": "ElyPrismLauncher Installer (Setup)",
+    "description": "ElyPrismLauncher - a custom Minecraft launcher with Ely.by auth support",
     "homepage": "https://github.com/ElyPrismLauncher/ElyPrismLauncher",
     "license": "GPL-3.0-only",
-    "url": "https://github.com/ElyPrismLauncher/ElyPrismLauncher/releases/download/10.0.5/ElyPrismLauncher-Windows-MSVC-Setup-10.0.5.exe",
+    "url": "https://github.com/ElyPrismLauncher/ElyPrismLauncher/releases/download/$version/ElyPrismLauncher-Windows-MSVC-Setup-$version.exe",
     "hash": "sha256:b446e852456512f3743b4b0025795edbfd7510bca9e1dd30204cdeb20c032496",
     "installer": {
         "script": [
-            "# Run the installer and wait for user to finish",
-            "Start-Process -FilePath \"$dir\\$fname\" -Wait"
+            "Start-Process -FilePath \"$dir\\$fname\" -Wait",
+            "Remove-Item \"$dir\\$fname\" -Force"
         ]
     },
     "checkver": {
-        "github": "https://github.com/ElyPrismLauncher/ElyPrismLauncher"
+        "github": "https://github.com/ElyPrismLauncher/ElyPrismLauncher",
+        "regex": "v([\\d.]+)$"
     },
     "autoupdate": {
         "url": "https://github.com/ElyPrismLauncher/ElyPrismLauncher/releases/download/$version/ElyPrismLauncher-Windows-MSVC-Setup-$version.exe"
