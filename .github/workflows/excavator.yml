@@ -17,3 +17,43 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MANIFESTS_LOCATION: 'bucket'
+
+      # Check if Excavator actually committed any manifest updates.
+      # Writes updated=true to GITHUB_OUTPUT only if bucket/ files changed.
+      # All subsequent steps are gated on this — no new release = no VT scan.
+      - name: Check if manifests were updated
+        id: check_updates
+        shell: powershell
+        run: |
+          $diff = git diff HEAD~1 HEAD --name-only -- bucket/
+          if ($diff) {
+            Write-Host "Manifests updated:"
+            Write-Host $diff
+            echo "updated=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "No manifest changes detected, skipping VT scan."
+            echo "updated=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Download installers for VT scanning
+        if: steps.check_updates.outputs.updated == 'true'
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\vt-scan" -Force | Out-Null
+          Get-ChildItem -Path "bucket" -Filter "*.json" | ForEach-Object {
+            $json = Get-Content $_.FullName | ConvertFrom-Json
+            $url = $json.url
+            if (-not $url) { return }
+            $filename = [System.IO.Path]::GetFileName($url)
+            Write-Host "Downloading $filename from $url"
+            Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\vt-scan\$filename"
+          }
+
+      - name: VirusTotal Scan
+        if: steps.check_updates.outputs.updated == 'true'
+        uses: crazy-max/ghaction-virustotal@v4
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          request_rate: 4
+          files: |
+            ${{ runner.temp }}/vt-scan/*
