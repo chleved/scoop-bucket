@@ -44,9 +44,14 @@ jobs:
             $json = Get-Content $_.FullName | ConvertFrom-Json
             $url = $json.url
             if (-not $url) { return }
-            $filename = [System.IO.Path]::GetFileName($url)
+
+            # Resolve $version template if Excavator left it unresolved
+            $url = $url -replace '\$version', $json.version
+
+            $filename = [System.IO.Path]::GetFileName(($url -split '\?')[0])
             Write-Host "Downloading $filename from $url"
-            Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\vt-scan\$filename"
+            Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\vt-scan\$filename" `
+              -MaximumRedirection 10 -UseBasicParsing
           }
 
       - name: VirusTotal Scan
