@@ -1,64 +1,150 @@
 name: Bucket Auto-Updater
 on:
   schedule:
-    # Run once daily at 06:00 UTC
     - cron: '0 6 * * *'
-  workflow_dispatch: # Allows you to run it manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
   excavate:
-    name: Excavate
+    name: Excavate & VT Scan
     runs-on: windows-latest
+    permissions:
+      contents: write
+      issues: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Excavate
-        uses: ScoopInstaller/GithubActions@main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MANIFESTS_LOCATION: 'bucket'
-
-      # Check if Excavator actually committed any manifest updates.
-      # Writes updated=true to GITHUB_OUTPUT only if bucket/ files changed.
-      # All subsequent steps are gated on this — no new release = no VT scan.
-      - name: Check if manifests were updated
-        id: check_updates
+      # 1. Update manifest locally (No committing yet)
+      - name: Install Scoop & Run Checkver
         shell: powershell
         run: |
-          $diff = git show --name-only --format="" HEAD -- bucket/
-          if ($diff) {
-            Write-Host "Manifests updated:"
-            Write-Host $diff
-            echo "updated=true" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "No manifest changes detected, skipping VT scan."
-            echo "updated=false" >> $env:GITHUB_OUTPUT
-          }
+          Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          
+          # Run checkver to update JSON files in the workspace
+          ~/scoop/apps/scoop/current/bin/checkver.ps1 * -Dir bucket -Update
 
-      - name: Download installers for VT scanning
-        if: steps.check_updates.outputs.updated == 'true'
+      # 2. Check if any version was bumped
+      - name: Detect Changed Manifests
+        id: diff
+        shell: powershell
+        run: |
+          $changed = git diff --name-only bucket/
+          if (-not $changed) {
+            Write-Host "No version bumps detected."
+            echo "updated=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          
+          echo "updated=true" >> $env:GITHUB_OUTPUT
+          $changedFiles = $changed -split "`n" | Where-Object { $_ -match '\.json$' }
+          $changedJson = $changedFiles | ConvertTo-Json -Compress
+          echo "changed_files=$changedJson" >> $env:GITHUB_OUTPUT
+
+      # 3. Download the actual files for scanning
+      - name: Download Installers
+        if: steps.diff.outputs.updated == 'true'
         shell: powershell
         run: |
           New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\vt-scan" -Force | Out-Null
-          Get-ChildItem -Path "bucket" -Filter "*.json" | ForEach-Object {
-            $json = Get-Content $_.FullName | ConvertFrom-Json
-            $url = $json.url
-            if (-not $url) { return }
-
-            # Resolve $version template if Excavator left it unresolved
-            $url = $url -replace '\$version', $json.version
-
-            $filename = [System.IO.Path]::GetFileName(($url -split '\?')[0])
-            Write-Host "Downloading $filename from $url"
-            Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\vt-scan\$filename" `
-              -MaximumRedirection 10 -UseBasicParsing
+          $files = '${{ steps.diff.outputs.changed_files }}' | ConvertFrom-Json
+          
+          foreach ($file in $files) {
+            $json = Get-Content $file | ConvertFrom-Json
+            $urls = @()
+            
+            # Robust extraction of URLs across Scoop's architecture schemas
+            if ($json.url) { $urls += @($json.url) }
+            if ($json.architecture) {
+                if ($json.architecture.'64bit'.url) { $urls += @($json.architecture.'64bit'.url) }
+                if ($json.architecture.'32bit'.url) { $urls += @($json.architecture.'32bit'.url) }
+                if ($json.architecture.'arm64'.url) { $urls += @($json.architecture.'arm64'.url) }
+            }
+            
+            foreach ($url in $urls) {
+                $finalUrl = $url -replace '\$version', $json.version
+                $filename = [System.IO.Path]::GetFileName(($finalUrl -split '\?')[0])
+                Write-Host "Downloading $filename..."
+                Invoke-WebRequest -Uri $finalUrl -OutFile "$env:RUNNER_TEMP\vt-scan\$filename" -UseBasicParsing
+            }
           }
 
-      - name: VirusTotal Scan
-        if: steps.check_updates.outputs.updated == 'true'
+      # 4. Upload to VirusTotal
+      - name: VirusTotal Upload
+        id: vt_scan
+        if: steps.diff.outputs.updated == 'true'
         uses: crazy-max/ghaction-virustotal@v4
         with:
           vt_api_key: ${{ secrets.VT_API_KEY }}
           request_rate: 4
           files: |
             ${{ runner.temp }}/vt-scan/*
+
+      # 5 & 6. Wait 1 hour -> If Safe, allow; If Unsafe, Block & Ask for review
+      - name: Poll VT (1 Hour) & Evaluate
+        if: steps.diff.outputs.updated == 'true'
+        timeout-minutes: 65 # 60 mins for logic + 5m buffer
+        shell: powershell
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Required for the `gh` cli
+          ANALYSIS_OUTPUT: ${{ steps.vt_scan.outputs.analysis }}
+        run: |
+          $headers = @{ "x-apikey" = $env:VT_API_KEY }
+          $flagged = @()
+          $entries = $env:ANALYSIS_OUTPUT -split ','
+          
+          foreach ($entry in $entries) {
+            if (-not $entry.Trim()) { continue }
+            $parts = $entry.Trim() -split '='
+            $filename = $parts[0].Trim()
+            $analysisId = ($parts[1..($parts.Count-1)] -join '=').Trim().TrimEnd('/').Split('/')[-1]
+            
+            Write-Host "Waiting up to 1 hour for VT analysis of $filename..."
+            
+            # 120 loops * 30 seconds = 60 minutes max waiting time
+            $result = $null
+            for ($i = 0; $i -lt 120; $i++) {
+              Start-Sleep -Seconds 30
+              $result = Invoke-RestMethod -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" -Headers $headers
+              if ($result.data.attributes.status -eq 'completed') { break }
+              
+              if ($i -eq 119) {
+                # TIMEOUT: Use GitHub CLI to create an issue
+                gh issue create --title "VT Alert: Analysis timed out" --body "The auto-update was blocked because VT did not finish within 1 hour. Manual review needed." --label "security"
+                git reset --hard
+                Write-Error "VT analysis timed out."
+                exit 1
+              }
+            }
+            
+            $stats = $result.data.attributes.stats
+            Write-Host "$filename - Malicious: $($stats.malicious), Suspicious: $($stats.suspicious)"
+            
+            if ($stats.malicious -gt 0 -or $stats.suspicious -gt 0) {
+              $flagged += "$filename flagged. Malicious: $($stats.malicious), Suspicious: $($stats.suspicious)"
+            }
+          }
+          
+          if ($flagged.Count -gt 0) {
+            # THREAT DETECTED: Use GitHub CLI to create an issue
+            $body = "## VirusTotal flagged a manifest update`n`nThe update was **blocked**. Manual review required.`n`n" + ($flagged -join "`n")
+            gh issue create --title "VT Alert: Flagged installer detected" --body "$body" --label "security"
+            
+            # Revert local changes so step 7 has nothing to commit
+            git reset --hard
+            Write-Error "VT flagged a file. Update aborted."
+            exit 1
+          }
+
+      # 7. Update version (Push safely)
+      - name: Commit and Push Safe Update
+        if: steps.diff.outputs.updated == 'true' && success()
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/
+          git commit -m "Auto-update manifests (VirusTotal Safe)"
+          git push
