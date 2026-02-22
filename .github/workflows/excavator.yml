@@ -12,10 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install hub
-        run: choco install hub -y
-        shell: powershell
-
       - name: Excavate
         uses: ScoopInstaller/GithubActions@main
         env:
