@@ -7,14 +7,17 @@
     "hash": "sha256:b446e852456512f3743b4b0025795edbfd7510bca9e1dd30204cdeb20c032496",
     "installer": {
         "script": [
-            "# Run the installer and wait for user to finish",
-            "Start-Process -FilePath \"$dir\\$fname\" -Wait"
+            "# 1. Run the installer and wait",
+            "Start-Process -FilePath \"$dir\\$fname\" -Wait",
+
+            "# 2. Delete the installer file so it doesn't appear in Windows Search",
+            "Remove-Item \"$dir\\$fname\" -Force"
         ]
     },
     "checkver": {
         "github": "https://github.com/ElyPrismLauncher/ElyPrismLauncher"
     },
     "autoupdate": {
-        "url": "https://github.com/ElyPrismLauncher/ElyPrismLauncher/releases/download/$version/ElyPrismLauncher-Windows-MSVC-Setup-$version.exe"
+        "url": "https://github.com/ElyPrismLauncher/ElyPrismLauncher/releases/download/$version/ElyPrismLauncher-Windows-MSVC-Setup-$version.exe",
     }
 }

@@ -1,8 +1,8 @@
 name: Bucket Auto-Updater
 on:
   schedule:
-    # Run every 4 hours
-    - cron: '0 */4 * * *'
+    # Run once daily at 06:00 UTC
+    - cron: '0 6 * * *'
   workflow_dispatch: # Allows you to run it manually from the Actions tab
 
 jobs:
@@ -11,8 +11,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Excavate
-        uses: scoop-installer/scoop-action@v0.4.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ScoopInstaller/GithubActions@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANIFESTS_LOCATION: 'bucket'
