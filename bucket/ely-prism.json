@@ -1,6 +1,6 @@
 {
     "version": "10.0.5",
-    "description": "ElyPrismLauncher - a custom Minecraft launcher with Ely.by auth support",
+    "description": "Custom Minecraft launcher based on PrismLauncher, with Ely.by authentication support",
     "homepage": "https://github.com/ElyPrismLauncher/ElyPrismLauncher",
     "license": "GPL-3.0-only",
     "url": "https://github.com/ElyPrismLauncher/ElyPrismLauncher/releases/download/$version/ElyPrismLauncher-Windows-MSVC-Setup-$version.exe",
@@ -12,9 +12,25 @@
         ]
     },
     "checkver": {
-        "github": "https://github.com/ElyPrismLauncher/ElyPrismLauncher"
+        "github": "https://github.com/ElyPrismLauncher/ElyPrismLauncher",
+        "regex": "v?([\\d.]+)"
     },
     "autoupdate": {
         "url": "https://github.com/ElyPrismLauncher/ElyPrismLauncher/releases/download/$version/ElyPrismLauncher-Windows-MSVC-Setup-$version.exe"
-    }
+    },
+    "suggest": {
+        "Java 17 (recommended for Minecraft 1.17+)": [
+            "java/temurin17-jre",
+            "java/openjdk17"
+        ],
+        "Java 21 (required for Minecraft 1.20.5+)": [
+            "java/temurin21-jre",
+            "java/openjdk21"
+        ]
+    },
+    "notes": [
+        "ElyPrismLauncher uses Ely.by instead of Mojang/Microsoft for authentication.",
+        "A Java runtime is required to play Minecraft. See the 'suggest' entries above.",
+        "After install, launch ElyPrismLauncher from your Start Menu or Desktop shortcut."
+    ]
 }
