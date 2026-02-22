@@ -6,7 +6,7 @@ on:
 
 jobs:
   excavate:
-    name: Excavate & VT Scan
+    name: Excavate & Smart Scan
     runs-on: windows-latest
     permissions:
       contents: write
@@ -15,18 +15,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. Update manifest locally (No committing yet)
+      # 1. Update manifest locally
+      # This command AUTOMATICALLY writes the new version AND the new hash into the JSON file.
       - name: Install Scoop & Run Checkver
         shell: powershell
         run: |
           Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
           Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
-          
-          # Run checkver to update JSON files in the workspace
           ~/scoop/apps/scoop/current/bin/checkver.ps1 * -Dir bucket -Update
 
-      # 2. Check if any version was bumped
-      - name: Detect Changed Manifests
+      # 2. Check if git detected any changes
+      - name: Detect Changes
         id: diff
         shell: powershell
         run: |
@@ -36,13 +35,12 @@ jobs:
             echo "updated=false" >> $env:GITHUB_OUTPUT
             exit 0
           }
-          
           echo "updated=true" >> $env:GITHUB_OUTPUT
           $changedFiles = $changed -split "`n" | Where-Object { $_ -match '\.json$' }
           $changedJson = $changedFiles | ConvertTo-Json -Compress
           echo "changed_files=$changedJson" >> $env:GITHUB_OUTPUT
 
-      # 3. Download the actual files for scanning
+      # 3. Download the actual files to compute our own verification hash
       - name: Download Installers
         if: steps.diff.outputs.updated == 'true'
         shell: powershell
@@ -52,14 +50,13 @@ jobs:
           
           foreach ($file in $files) {
             $json = Get-Content $file | ConvertFrom-Json
-            $urls = @()
             
-            # Robust extraction of URLs across Scoop's architecture schemas
+            # Extract URLs (handles 64bit/32bit/arm64 structures)
+            $urls = @()
             if ($json.url) { $urls += @($json.url) }
             if ($json.architecture) {
                 if ($json.architecture.'64bit'.url) { $urls += @($json.architecture.'64bit'.url) }
                 if ($json.architecture.'32bit'.url) { $urls += @($json.architecture.'32bit'.url) }
-                if ($json.architecture.'arm64'.url) { $urls += @($json.architecture.'arm64'.url) }
             }
             
             foreach ($url in $urls) {
@@ -70,90 +67,88 @@ jobs:
             }
           }
 
-      # 4. Upload to VirusTotal
-      - name: VirusTotal Upload
-        id: vt_scan
+      # 4. SMART VT LOGIC: Check Hash -> Only Upload if Unknown
+      - name: VirusTotal Smart Check
         if: steps.diff.outputs.updated == 'true'
-        uses: crazy-max/ghaction-virustotal@v4
-        with:
-          vt_api_key: ${{ secrets.VT_API_KEY }}
-          request_rate: 4
-          files: |
-            ${{ runner.temp }}/vt-scan/*
-
-      # 5 & 6. Wait 1 hour -> If Safe, allow; If Unsafe, Block & Ask for review
-      - name: Poll VT (1 Hour) & Evaluate
-        if: steps.diff.outputs.updated == 'true'
-        timeout-minutes: 65 
+        timeout-minutes: 60
         shell: powershell
         env:
           VT_API_KEY: ${{ secrets.VT_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ANALYSIS_OUTPUT: ${{ steps.vt_scan.outputs.analysis }}
         run: |
           $headers = @{ "x-apikey" = $env:VT_API_KEY }
+          $files = Get-ChildItem -Path "$env:RUNNER_TEMP\vt-scan"
           $flagged = @()
-          $entries = $env:ANALYSIS_OUTPUT -split ','
-          
-          foreach ($entry in $entries) {
-            if (-not $entry.Trim()) { continue }
-            $parts = $entry.Trim() -split '='
-            $filename = $parts[0].Trim()
-            
-            # FIXED: Robust ID Extraction
-            # 1. Join parts in case URL has = signs (Base64 often does)
-            $fullUrl = ($parts[1..($parts.Count-1)] -join '=').Trim()
-            # 2. Remove '/detection' if it exists at the end
-            $cleanUrl = $fullUrl -replace '/detection/?$', ''
-            # 3. Grab the actual ID (the last part after the slash)
-            $analysisId = $cleanUrl.Split('/')[-1]
-            
-            Write-Host "Checking Analysis ID: $analysisId"
-            Write-Host "Waiting up to 1 hour for VT analysis of $filename..."
-            
-            # 120 loops * 30 seconds = 60 minutes max waiting time
-            $result = $null
-            for ($i = 0; $i -lt 120; $i++) {
-              Start-Sleep -Seconds 30
-              try {
-                $result = Invoke-RestMethod -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" -Headers $headers
-              } catch {
-                Write-Host "API Error: $($_.Exception.Message). Retrying..."
-                continue
-              }
 
-              $status = $result.data.attributes.status
-              Write-Host "Attempt $($i+1)/120 - Status: $status"
-              
-              if ($status -eq 'completed') { break }
-              
-              if ($i -eq 119) {
-                # TIMEOUT
-                gh issue create --title "VT Alert: Analysis timed out" --body "The auto-update was blocked because VT did not finish within 1 hour. Manual review needed." --label "security"
-                git reset --hard
-                Write-Error "VT analysis timed out."
-                exit 1
+          foreach ($file in $files) {
+            # 1. Calculate the Hash of the downloaded file
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower()
+            Write-Host "Checking $($file.Name)"
+            Write-Host "SHA256: $hash"
+
+            $analysisId = $null
+            $stats = $null
+
+            # 2. Ask VT: Do you know this hash?
+            try {
+              $response = Invoke-RestMethod -Uri "https://www.virustotal.com/api/v3/files/$hash" -Headers $headers -ErrorAction Stop
+              Write-Host ">> File is ALREADY KNOWN to VirusTotal."
+              $stats = $response.data.attributes.last_analysis_stats
+            } catch {
+              # 3. If 404, it means VT has never seen this file. We must upload it.
+              if ($_.Exception.Response.StatusCode -eq 404) {
+                 Write-Host ">> File is NEW. Uploading to VirusTotal..."
+                 
+                 # Use curl for stable multipart upload
+                 $uploadUrl = "https://www.virustotal.com/api/v3/files"
+                 $jsonResponse = curl.exe --silent --request POST --url $uploadUrl --header "x-apikey: $env:VT_API_KEY" --form "file=@$($file.FullName)"
+                 $uploadObj = $jsonResponse | ConvertFrom-Json
+                 $analysisId = $uploadObj.data.id
+              } else {
+                 Write-Error "VT API Error: $($_.Exception.Message)"
+                 exit 1
               }
             }
-            
-            $stats = $result.data.attributes.stats
-            Write-Host "$filename - Malicious: $($stats.malicious), Suspicious: $($stats.suspicious)"
-            
+
+            # 4. If we uploaded it, we must wait for the result
+            if ($analysisId) {
+                Write-Host ">> Waiting for analysis to complete..."
+                for ($i = 0; $i -lt 120; $i++) {
+                    Start-Sleep -Seconds 30
+                    $report = Invoke-RestMethod -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" -Headers $headers
+                    $status = $report.data.attributes.status
+                    Write-Host "Attempt $($i+1)/120 - Status: $status"
+                    
+                    if ($status -eq 'completed') { 
+                        $stats = $report.data.attributes.stats
+                        break 
+                    }
+                    if ($i -eq 119) {
+                        gh issue create --title "VT Alert: Timeout" --body "Timed out waiting for $hash" --label "security"
+                        exit 1 
+                    }
+                }
+            }
+
+            # 5. Evaluate Verdict
+            Write-Host ">> Verdict - Malicious: $($stats.malicious), Suspicious: $($stats.suspicious)"
             if ($stats.malicious -gt 0 -or $stats.suspicious -gt 0) {
-              $flagged += "$filename flagged. Malicious: $($stats.malicious), Suspicious: $($stats.suspicious)"
+               $flagged += "$($file.Name) (Malicious: $($stats.malicious))"
             }
           }
-          
+
+          # 6. Block Logic
           if ($flagged.Count -gt 0) {
-            $body = "## VirusTotal flagged a manifest update`n`nThe update was **blocked**. Manual review required.`n`n" + ($flagged -join "`n")
-            gh issue create --title "VT Alert: Flagged installer detected" --body "$body" --label "security"
+            $body = "## VirusTotal Flagged Files`nThe update was blocked.`n`n" + ($flagged -join "`n")
+            gh issue create --title "VT Alert: Malware Detected" --body "$body" --label "security"
             git reset --hard
-            Write-Error "VT flagged a file. Update aborted."
+            Write-Error "Malware detected. Aborting."
             exit 1
           }
 
-        # 7. Update version (Push safely)
-      - name: Commit and Push Safe Update
+      # 5. Commit & Push
+      # The 'ely-prism.json' being committed HERE already contains the hash calculated by Step 1.
+      - name: Commit and Push
         if: steps.diff.outputs.updated == 'true' && success()
         shell: powershell
         run: |
@@ -161,11 +156,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add bucket/
           
-          # Only commit if there are actually files staged
           if (git status --porcelain) {
             git commit -m "Auto-update manifests (VirusTotal Safe)"
             git push
-            Write-Host "Successfully pushed safe manifest updates!"
+            Write-Host "Success! Manifest updated with new version and hash."
           } else {
-            Write-Host "Nothing to commit. Manifests are up to date."
+            Write-Host "No changes to commit."
           }
