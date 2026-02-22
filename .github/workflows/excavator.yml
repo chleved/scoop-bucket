@@ -138,7 +138,7 @@ jobs:
             exit 1
           }
 
-      # 7. Update version (Push safely)
+        # 7. Update version (Push safely)
       - name: Commit and Push Safe Update
         if: steps.diff.outputs.updated == 'true' && success()
         shell: powershell
@@ -146,5 +146,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add bucket/
-          git commit -m "Auto-update manifests (VirusTotal Safe)"
-          git push
+          
+          # Only commit if there are actually files staged
+          if (git status --porcelain) {
+            git commit -m "Auto-update manifests (VirusTotal Safe)"
+            git push
+            Write-Host "Successfully pushed safe manifest updates!"
+          } else {
+            Write-Host "Nothing to commit. Manifests are up to date."
+          }
