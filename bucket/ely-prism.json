@@ -13,10 +13,14 @@
     },
     "checkver": {
         "github": "https://github.com/ElyPrismLauncher/ElyPrismLauncher",
-        "regex": "v?([\\d.]+)"
+        "regex": "v?(\\d+\\.\\d+\\.\\d+)"
     },
     "autoupdate": {
-        "url": "https://github.com/ElyPrismLauncher/ElyPrismLauncher/releases/download/$version/ElyPrismLauncher-Windows-MSVC-Setup-$version.exe"
+        "url": "https://github.com/ElyPrismLauncher/ElyPrismLauncher/releases/download/$version/ElyPrismLauncher-Windows-MSVC-Setup-$version.exe",
+        "hash": {
+            "url": "https://api.github.com/repos/ElyPrismLauncher/ElyPrismLauncher/releases/tags/$version",
+            "regex": "ElyPrismLauncher-Windows-MSVC-Setup-$version\\.exe[^\\n]*sha256:(?<hash>[a-fA-F0-9]{64})"
+        }
     },
     "suggest": {
         "Java 17 (recommended for Minecraft 1.17+)": [
