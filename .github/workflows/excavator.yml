@@ -38,10 +38,10 @@ jobs:
 
       # 1. Update ALL manifests locally in one go
       - name: Install Scoop & Run Checkver
-        shell: powershell
+        shell: pwsh
         run: |
           # BUG FIX: Use -Version 2 instead of -Version Latest.
-          # '-Version Latest' is non-deterministic — its meaning tightens with each new
+          # '-Version Latest' is non-deterministic - its meaning tightens with each new
           # PowerShell release, so a script that passes today may break silently after
           # a runner update. Version 2 gives us the two guarantees we need:
           #   1. Uninitialized variable references throw.
@@ -57,7 +57,7 @@ jobs:
       # 2. Check for changes
       - name: Detect Changes
         id: diff
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version 2
@@ -82,11 +82,11 @@ jobs:
       # 3. Download all changed artifacts and build a metadata map for VT scanning
       - name: Download & Analyze
         if: steps.diff.outputs.updated == 'true'
-        shell: powershell
+        shell: pwsh
         # SECURITY: Step outputs are passed through environment variables, NOT via
         # inline ${{ }} expressions inside the run block.
         # Inline expressions are string-interpolated into the PowerShell script
-        # *before* the runner executes it — making them a script injection vector
+        # *before* the runner executes it - making them a script injection vector
         # if the value contains shell metacharacters or newlines. Environment
         # variables are expanded safely at runtime.
         env:
@@ -170,7 +170,7 @@ jobs:
         id: scan
         if: steps.diff.outputs.updated == 'true'
         timeout-minutes: 60
-        shell: powershell
+        shell: pwsh
         env:
           VT_API_KEY: ${{ secrets.VT_API_KEY }}
         run: |
@@ -185,7 +185,7 @@ jobs:
           $unsafeMeta = @()
 
           foreach ($file in $files) {
-            # Pace to ~3.75 req/min — safely under the 4/min free-tier ceiling.
+            # Pace to ~3.75 req/min - safely under the 4/min free-tier ceiling.
             if ($file.Name -ne $files[0].Name) {
                 Write-Host "Pacing API: sleeping 16s..."
                 Start-Sleep -Seconds 16
@@ -199,7 +199,7 @@ jobs:
             $stats      = $null
             $analysisId = $null
 
-            # Step A: Hash lookup — cheapest path, 1 API call, no file upload needed
+            # Step A: Hash lookup - cheapest path, 1 API call, no file upload needed
             try {
               $response = Invoke-RestMethod `
                 -Uri "https://www.virustotal.com/api/v3/files/$hash" `
@@ -299,7 +299,7 @@ jobs:
             }
           }
 
-          # Same @() idiom as Detect Changes — guarantees a JSON array in PS 5.1.
+          # Same @() idiom as Detect Changes - guarantees a JSON array in PS 5.1.
           $safeJson = ConvertTo-Json -InputObject @($safeFiles) -Compress
           echo "safe_files=$safeJson" >> $env:GITHUB_OUTPUT
           $unsafeMeta | ConvertTo-Json -Depth 5 | Set-Content "$env:RUNNER_TEMP\unsafe_list.json"
@@ -307,7 +307,7 @@ jobs:
       # 5. BATCH COMMIT: Push all safe updates to main in one commit
       - name: Push Safe Updates (Batch)
         if: steps.scan.outputs.safe_files != '[]' && steps.scan.outputs.safe_files != ''
-        shell: powershell
+        shell: pwsh
         env:
           SAFE_FILES_JSON: ${{ steps.scan.outputs.safe_files }}
         run: |
@@ -343,7 +343,7 @@ jobs:
       #    Skips app:version pairs already permanently quarantined in QUARANTINE_LIST.
       - name: Process Unsafe Updates (Individual PRs)
         if: steps.diff.outputs.updated == 'true'
-        shell: powershell
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # QUARANTINE_LIST is a repository Actions variable (not a secret) that
@@ -381,7 +381,7 @@ jobs:
 
             # ── QUARANTINE GATE ──────────────────────────────────────────────────
             # If this exact app:version was previously reviewed and confirmed unsafe,
-            # skip silently — no duplicate PR. The daily run will never re-flag it.
+            # skip silently - no duplicate PR. The daily run will never re-flag it.
             if ($quarantineList -contains $quarantineKey) {
                 Write-Host ">> SKIP (permanently quarantined): $quarantineKey" -ForegroundColor Cyan
                 continue
@@ -409,8 +409,8 @@ jobs:
             # and write it to QUARANTINE_LIST when this PR is closed without merging.
             $body  = "## ⚠️ Security Alert: $appName $version`n`n"
             $body += "> VirusTotal flagged this update. Review the report below, then "
-            $body += "either **merge** (false positive — safe to ship) or "
-            $body += "**close without merging** (confirmed unsafe — permanently quarantined).`n`n"
+            $body += "either **merge** (false positive - safe to ship) or "
+            $body += "**close without merging** (confirmed unsafe - permanently quarantined).`n`n"
             $body += "| | |`n"
             $body += "|---|---|`n"
             $body += "| **App** | ``$appName`` |`n"
@@ -420,10 +420,10 @@ jobs:
             $body += "| **Release Page** | [GitHub release]($($item.ReleaseUrl)) |`n`n"
             $body += "---`n`n"
             $body += "### What happens after you decide`n`n"
-            $body += "**Close without merging** → ``quarantine-updater.yml`` automatically adds "
+            $body += "**Close without merging** -> ``quarantine-updater.yml`` automatically adds "
             $body += "``$quarantineKey`` to the ``QUARANTINE_LIST`` repo variable. Future daily "
-            $body += "runs will silently skip this version — no duplicate PRs.`n`n"
-            $body += "**Merge** → the manifest is shipped to users. No quarantine entry is created, "
+            $body += "runs will silently skip this version - no duplicate PRs.`n`n"
+            $body += "**Merge** -> the manifest is shipped to users. No quarantine entry is created, "
             $body += "so a future release of this app will still be scanned normally.`n`n"
             $body += "<!-- quarantine-key: $quarantineKey -->"
 
