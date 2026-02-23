@@ -52,7 +52,7 @@ jobs:
 
           Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
           Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
-          ~/scoop/apps/scoop/current/bin/checkver.ps1 * -Dir bucket -Update
+          & { Set-StrictMode -Off; ~/scoop/apps/scoop/current/bin/checkver.ps1 * -Dir bucket -Update }
 
       # 2. Check for changes
       - name: Detect Changes
@@ -69,6 +69,11 @@ jobs:
             exit 0
           }
           echo "updated=true" >> $env:GITHUB_OUTPUT
+
+          # TOCTOU FIX: Backup the entire bucket state immediately after checkver.
+          # Step 6 restores manifests from here instead of re-running checkver,
+          # guaranteeing the PR contains the exact hash that VirusTotal scanned.
+          Copy-Item -Path bucket -Destination "$env:RUNNER_TEMP\bucket_backup" -Recurse
 
           $changedFiles = $changed -split "`n" | Where-Object { $_ -match '\.json$' }
 
@@ -367,6 +372,7 @@ jobs:
           }
 
           git reset --hard
+          git clean -fd
           git checkout main
           git pull
 
@@ -389,15 +395,30 @@ jobs:
 
             Write-Host ">> Opening security review PR for: $quarantineKey" -ForegroundColor Yellow
 
-            # BUG FIX: Use seconds precision ('yyyyMMddHHmmss') instead of minutes
-            # ('yyyyMMddHHmm'). If two or more unsafe apps are processed in the same
-            # minute, the second 'git checkout -b' would fail with "branch already exists".
-            $branch = "security/$appName-$(Get-Date -Format 'yyyyMMddHHmmss')"
+            # FIX: Deterministic branch names prevent duplicate PRs.
+            # If a security PR is already pending review for this app:version,
+            # skip creating another one.
+            $branch = "security/$appName-$version"
+            $remoteExists = git ls-remote --heads origin $branch
+            if ($remoteExists) {
+                Write-Host ">> PR already pending for $quarantineKey (branch $branch exists). Skipping."
+                continue
+            }
             git checkout -b $branch main
 
-            # Re-run checkver for only this app to re-apply its version bump.
-            # (We reset --hard above so the working tree is clean again.)
-            ~/scoop/apps/scoop/current/bin/checkver.ps1 $appName -Dir bucket -Update
+            # TOCTOU FIX: Restore the manifest from the backup taken in Step 2
+            # instead of re-running checkver. This guarantees the PR contains
+            # the EXACT hash that VirusTotal scanned, not a potentially different
+            # one fetched from an upstream that may have hot-swapped the binary.
+            Copy-Item "$env:RUNNER_TEMP\bucket_backup\$appName.json" -Destination $jsonPath -Force
+
+            # Guard: If the restore produced no diff (e.g. manifest already matches),
+            # skip commit to avoid a fatal "nothing to commit" crash.
+            if (-not (git status --porcelain $jsonPath)) {
+                Write-Warning ">> Checkver produced no changes for $appName. Skipping PR."
+                git checkout main
+                continue
+            }
 
             git add $jsonPath
             git commit -m "security: quarantine $appName $version for manual review"

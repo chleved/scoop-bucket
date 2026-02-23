@@ -26,7 +26,8 @@ jobs:
     # NOT be quarantined — users should receive it.
     if: |
       startsWith(github.event.pull_request.head.ref, 'security/') &&
-      github.event.pull_request.merged == false
+      github.event.pull_request.merged == false &&
+      github.event.pull_request.user.login == 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
       # 'actions: write' is required to create or update repository variables
@@ -45,7 +46,7 @@ jobs:
           # Passing the body through $PR_BODY (env var) instead of inline
           # ${{ github.event.pull_request.body }} prevents script injection
           # if the PR body contains characters that would break the shell expression.
-          KEY=$(echo "$PR_BODY" | grep -oP '(?<=<!-- quarantine-key: )[\w\-\.]+:[\w\-\.]+(?= -->)' || true)
+          KEY=$(echo "$PR_BODY" | grep -oP '(?<=<!-- quarantine-key:\s*)\S+?(?=\s*-->)' || true)
 
           if [ -z "$KEY" ]; then
             echo "::warning::No quarantine-key comment found in PR #$PR_NUMBER. Was this PR created by excavator.yml? Skipping."
