@@ -451,12 +451,23 @@ jobs:
             $body += "so a future release of this app will still be scanned normally.`n`n"
             $body += "<!-- quarantine-key: $quarantineKey -->"
 
+            # Temporarily allow non-terminating errors so a gh failure
+            # doesn't crash the loop and skip subsequent unsafe apps.
+            $ErrorActionPreference = 'Continue'
             gh pr create `
               --title "security: $appName $version flagged by VirusTotal" `
               --body  "$body" `
               --base  main `
               --head  $branch `
               --label "security"
+
+            if ($LASTEXITCODE -ne 0) {
+                # PR creation failed (e.g. permissions). Clean up the remote branch
+                # so it doesn't permanently block future runs via the deterministic branch check.
+                Write-Warning ">> Failed to create PR for $quarantineKey (exit code $LASTEXITCODE). Cleaning up remote branch."
+                git push origin --delete $branch 2>$null
+            }
+            $ErrorActionPreference = 'Stop'
 
             git checkout main
           }
