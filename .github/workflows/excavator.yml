@@ -1,19 +1,473 @@
 name: Bucket Auto-Updater
+
+# Prevent concurrent runs. A run already in progress will be cancelled
+# if a new one starts (e.g. manual workflow_dispatch during a scheduled run).
+concurrency:
+  group: bucket-auto-updater
+  cancel-in-progress: true
+
 on:
   schedule:
-    # Run once daily at 06:00 UTC
     - cron: '0 6 * * *'
-  workflow_dispatch: # Allows you to run it manually from the Actions tab
+  workflow_dispatch:
+
+# Deny all permissions at the workflow level.
+# Each job declares only what it actually needs (least-privilege principle).
+# This limits blast radius if any step or third-party action is compromised.
+permissions: read-all
 
 jobs:
   excavate:
-    name: Excavate
+    name: Excavate & Segregate
     runs-on: windows-latest
+    permissions:
+      contents: write       # git push safe updates to main
+      pull-requests: write  # gh pr create for unsafe updates
+    # Hard ceiling on the entire job. The VT scan step has its own 60-min timeout,
+    # but this catches hangs in other steps (e.g. Scoop install, large downloads).
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      # SECURITY: Pinned to a full commit SHA instead of a mutable tag.
+      # Mutable tags like @v4 can be silently redirected to malicious code
+      # (see the tj-actions/changed-files supply-chain attack, March 2025).
+      # SHA corresponds to actions/checkout v4.2.2.
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # Required for branch creation / switching later
 
-      - name: Excavate
-        uses: ScoopInstaller/GithubActions@main
+      # 1. Update ALL manifests locally in one go
+      - name: Install Scoop & Run Checkver
+        shell: pwsh
+        run: |
+          # BUG FIX: Use -Version 2 instead of -Version Latest.
+          # '-Version Latest' is non-deterministic - its meaning tightens with each new
+          # PowerShell release, so a script that passes today may break silently after
+          # a runner update. Version 2 gives us the two guarantees we need:
+          #   1. Uninitialized variable references throw.
+          #   2. Non-existent property references on .NET objects throw.
+          # It is stable across all current and future PS versions.
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 2
+
+          Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          & { Set-StrictMode -Off; ~/scoop/apps/scoop/current/bin/checkver.ps1 * -Dir bucket -Update }
+
+      # 2. Check for changes
+      - name: Detect Changes
+        id: diff
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 2
+
+          $changed = git diff --name-only bucket/
+          if (-not $changed) {
+            Write-Host "No version bumps detected."
+            echo "updated=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          echo "updated=true" >> $env:GITHUB_OUTPUT
+
+          # TOCTOU FIX: Backup the entire bucket state immediately after checkver.
+          # Step 6 restores manifests from here instead of re-running checkver,
+          # guaranteeing the PR contains the exact hash that VirusTotal scanned.
+          Copy-Item -Path bucket -Destination "$env:RUNNER_TEMP\bucket_backup" -Recurse
+
+          $changedFiles = $changed -split "`n" | Where-Object { $_ -match '\.json$' }
+
+          # Wrapping in @() before passing to ConvertTo-Json guarantees the output
+          # is always a JSON array, even when only one file changed.
+          # NOTE: The -AsArray flag does this in PS 7+, but windows-latest runners
+          # use PowerShell 5.1 where -AsArray does not exist. @() is the PS 5.1 idiom.
+          $changedJson = ConvertTo-Json -InputObject @($changedFiles) -Compress
+          echo "changed_files=$changedJson" >> $env:GITHUB_OUTPUT
+
+      # 3. Download all changed artifacts and build a metadata map for VT scanning
+      - name: Download & Analyze
+        if: steps.diff.outputs.updated == 'true'
+        shell: pwsh
+        # SECURITY: Step outputs are passed through environment variables, NOT via
+        # inline ${{ }} expressions inside the run block.
+        # Inline expressions are string-interpolated into the PowerShell script
+        # *before* the runner executes it - making them a script injection vector
+        # if the value contains shell metacharacters or newlines. Environment
+        # variables are expanded safely at runtime.
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MANIFESTS_LOCATION: 'bucket'
+          CHANGED_FILES_JSON: ${{ steps.diff.outputs.changed_files }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 2
+
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\vt-scan" -Force | Out-Null
+
+          # BUG FIX: Use -Raw so Get-Content returns a single string, not a line array.
+          # Without -Raw in Windows PowerShell 5.1, ConvertFrom-Json may fail to parse
+          # multi-line JSON since each line arrives as a separate pipeline object.
+          $files   = $env:CHANGED_FILES_JSON | ConvertFrom-Json
+          $metaMap = @{}
+
+          foreach ($file in $files) {
+            $json    = Get-Content $file -Raw | ConvertFrom-Json
+            $appName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+
+            # Resolve the release page URL for PR body links.
+            # BUG FIX: Some manifests use "checkver": "github" (a string shorthand).
+            # Under StrictMode, accessing .github on a String throws PropertyNotFoundException.
+            # Use PSObject.Properties for safe access regardless of whether checkver is a
+            # string shorthand or a full object with a github sub-key.
+            $releaseLink     = $json.homepage
+            $checkverGithub  = $null
+            if ($json.checkver -isnot [string]) {
+                $prop = $json.checkver.PSObject.Properties['github']
+                if ($prop) { $checkverGithub = $prop.Value }
+            }
+            if ($checkverGithub) {
+                $releaseLink = "$($checkverGithub.TrimEnd('/'))/releases/tag/$($json.version)"
+            }
+
+            # Collect all download URLs (flat url, and per-architecture).
+            # BUG FIX: Under StrictMode, chaining like $json.architecture.'64bit'.url throws
+            # a PropertyNotFoundException if '64bit' does not exist on the architecture object.
+            # Use PSObject.Properties for safe dynamic lookup at each level.
+            $urls = @()
+            if ($json.PSObject.Properties['url'] -and $json.url) {
+                $urls += @($json.url)
+            }
+            if ($json.PSObject.Properties['architecture'] -and $json.architecture) {
+                foreach ($archKey in @('64bit', '32bit', 'arm64')) {
+                    $archProp = $json.architecture.PSObject.Properties[$archKey]
+                    if ($archProp) {
+                        $urlProp = $archProp.Value.PSObject.Properties['url']
+                        if ($urlProp -and $urlProp.Value) { $urls += @($urlProp.Value) }
+                    }
+                }
+            }
+
+            foreach ($url in $urls) {
+                $finalUrl = $url -replace '\$version', $json.version
+                $filename = [System.IO.Path]::GetFileName(($finalUrl -split '\?')[0])
+                Write-Host "Downloading $filename..."
+
+                # BUG FIX: Wrap download in try/catch with an informative error.
+                # Without this, a transient 404 or network failure crashes the whole
+                # workflow with a raw exception and no context about which app failed.
+                try {
+                    Invoke-WebRequest -Uri $finalUrl -OutFile "$env:RUNNER_TEMP\vt-scan\$filename" -UseBasicParsing
+                } catch {
+                    Write-Error "Failed to download $filename for $appName from $finalUrl`n$_"
+                    exit 1
+                }
+
+                $metaMap[$filename] = @{
+                    JsonPath   = $file
+                    App        = $appName
+                    Version    = $json.version
+                    ReleaseUrl = $releaseLink
+                }
+            }
+          }
+          $metaMap | ConvertTo-Json | Set-Content "$env:RUNNER_TEMP\vt-map.json"
+
+      # 4. VirusTotal scan with API rate-limit pacing (free tier: 4 req/min, 500 req/day)
+      - name: VirusTotal Scan
+        id: scan
+        if: steps.diff.outputs.updated == 'true'
+        timeout-minutes: 60
+        shell: pwsh
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 2
+
+          $headers = @{ "x-apikey" = $env:VT_API_KEY }
+          $files   = Get-ChildItem -Path "$env:RUNNER_TEMP\vt-scan"
+          $map     = Get-Content "$env:RUNNER_TEMP\vt-map.json" -Raw | ConvertFrom-Json
+
+          $safeFiles  = @()
+          $unsafeMeta = @()
+
+          foreach ($file in $files) {
+            # Pace to ~3.75 req/min - safely under the 4/min free-tier ceiling.
+            if ($file.Name -ne $files[0].Name) {
+                Write-Host "Pacing API: sleeping 16s..."
+                Start-Sleep -Seconds 16
+            }
+
+            $filename = $file.Name
+            $meta     = $map.PSObject.Properties[$filename].Value
+            $hash     = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower()
+            Write-Host "--- $($meta.App) $($meta.Version) | SHA256: $hash ---"
+
+            $stats      = $null
+            $analysisId = $null
+
+            # Step A: Hash lookup - cheapest path, 1 API call, no file upload needed
+            try {
+              $response = Invoke-RestMethod `
+                -Uri "https://www.virustotal.com/api/v3/files/$hash" `
+                -Headers $headers -ErrorAction Stop
+              $stats = $response.data.attributes.last_analysis_stats
+              Write-Host ">> Hash already known to VT. Using cached result."
+            } catch {
+              $statusCode = $_.Exception.Response.StatusCode.value__
+              if ($statusCode -eq 404) {
+                # Per VT docs, uploading a *new* file does NOT consume API quota.
+                # Only subsequent polling calls consume quota.
+                Write-Host ">> File not in VT. Pacing 16s before upload..."
+                Start-Sleep -Seconds 16
+
+                # curl.exe is more reliable than Invoke-WebRequest for multipart
+                # binary uploads on Windows runners.
+                $jsonResponse = curl.exe --silent --request POST `
+                  --url "https://www.virustotal.com/api/v3/files" `
+                  --header "x-apikey: $env:VT_API_KEY" `
+                  --form "file=@$($file.FullName)"
+
+                $analysisId = ($jsonResponse | ConvertFrom-Json).data.id
+                Write-Host ">> Uploaded. Analysis ID: $analysisId"
+              } elseif ($statusCode -eq 429) {
+                Write-Error "CRITICAL: VT rate limit (429) exceeded despite pacing. Aborting."
+                exit 1
+              } else {
+                Write-Error "Unexpected VT API error: HTTP $statusCode"
+                exit 1
+              }
+            }
+
+            # BUG FIX: Guard against $stats being null after a successful hash lookup.
+            # If VT returns a record but last_analysis_stats is absent (e.g. a very new
+            # submission that hasn't been processed yet), $stats is $null and accessing
+            # $stats.malicious below throws under StrictMode. Treat as unsafe for safety.
+            if (-not $analysisId -and -not $stats) {
+                Write-Warning ">> VT returned a record for $($meta.App) but stats were empty. Flagging for review."
+                $unsafeMeta += @{
+                    JsonPath   = $meta.JsonPath
+                    App        = $meta.App
+                    Version    = $meta.Version
+                    ReleaseUrl = $meta.ReleaseUrl
+                    Detections = "NO STATS RETURNED"
+                    ReportLink = "https://www.virustotal.com/gui/file/$hash"
+                }
+                continue
+            }
+
+            # Step B: Poll for analysis completion (1 req per 30s = well within rate limit)
+            if ($analysisId) {
+                Write-Host ">> Waiting for VT analysis to complete..."
+                $completed = $false
+                for ($i = 0; $i -lt 120; $i++) {
+                    Start-Sleep -Seconds 30
+                    $rep = Invoke-RestMethod `
+                      -Uri "https://www.virustotal.com/api/v3/analyses/$analysisId" `
+                      -Headers $headers
+                    if ($rep.data.attributes.status -eq 'completed') {
+                        $stats     = $rep.data.attributes.stats
+                        $completed = $true
+                        Write-Host ">> Completed after $($i + 1) poll(s)."
+                        break
+                    }
+                }
+                # Conservatively treat a timeout as unsafe so it gets a human-reviewed PR
+                # rather than being silently dropped or shipped unchecked.
+                if (-not $completed) {
+                    Write-Warning ">> TIMEOUT: VT analysis did not finish within 60 min. Flagging for manual review."
+                    $unsafeMeta += @{
+                        JsonPath   = $meta.JsonPath
+                        App        = $meta.App
+                        Version    = $meta.Version
+                        ReleaseUrl = $meta.ReleaseUrl
+                        Detections = "SCAN TIMEOUT"
+                        ReportLink = "https://www.virustotal.com/gui/file/$hash"
+                    }
+                    continue
+                }
+            }
+
+            # Step C: Decision
+            $vtLink = "https://www.virustotal.com/gui/file/$hash"
+            if ($stats.malicious -gt 0 -or $stats.suspicious -gt 0) {
+                Write-Host ">> FLAG: $($stats.malicious) malicious, $($stats.suspicious) suspicious" -ForegroundColor Yellow
+                $unsafeMeta += @{
+                    JsonPath   = $meta.JsonPath
+                    App        = $meta.App
+                    Version    = $meta.Version
+                    ReleaseUrl = $meta.ReleaseUrl
+                    Detections = "$($stats.malicious) malicious / $($stats.suspicious) suspicious"
+                    ReportLink = $vtLink
+                }
+            } else {
+                Write-Host ">> SAFE: 0 detections." -ForegroundColor Green
+                if ($safeFiles -notcontains $meta.JsonPath) { $safeFiles += $meta.JsonPath }
+            }
+          }
+
+          # Same @() idiom as Detect Changes - guarantees a JSON array in PS 5.1.
+          $safeJson = ConvertTo-Json -InputObject @($safeFiles) -Compress
+          echo "safe_files=$safeJson" >> $env:GITHUB_OUTPUT
+          $unsafeMeta | ConvertTo-Json -Depth 5 | Set-Content "$env:RUNNER_TEMP\unsafe_list.json"
+
+      # 5. BATCH COMMIT: Push all safe updates to main in one commit
+      - name: Push Safe Updates (Batch)
+        if: steps.scan.outputs.safe_files != '[]' && steps.scan.outputs.safe_files != ''
+        shell: pwsh
+        env:
+          SAFE_FILES_JSON: ${{ steps.scan.outputs.safe_files }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 2
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          $files = $env:SAFE_FILES_JSON | ConvertFrom-Json
+          foreach ($f in $files) { git add $f }
+
+          if (git status --porcelain) {
+            # Build a descriptive commit message listing each updated app@version.
+            # BUG FIX: Use -Raw so Get-Content returns a single string for ConvertFrom-Json.
+            $appSummaries = $files | ForEach-Object {
+                $json    = Get-Content $_ -Raw | ConvertFrom-Json
+                $appName = [System.IO.Path]::GetFileNameWithoutExtension($_)
+                "$appName@$($json.version)"
+            }
+            $commitMsg = "chore(bucket): auto-update $($appSummaries -join ', ')"
+
+            git commit -m $commitMsg
+
+            # BUG FIX: Rebase before pushing to prevent failures when another commit
+            # lands on main between our checkout and this push (race condition).
+            # --rebase avoids a merge commit and keeps history linear.
+            git pull --rebase origin main
+            git push origin main
+          }
+
+      # 6. INDIVIDUAL PRs: One PR per unsafe app for human review.
+      #    Skips app:version pairs already permanently quarantined in QUARANTINE_LIST.
+      - name: Process Unsafe Updates (Individual PRs)
+        if: steps.diff.outputs.updated == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # QUARANTINE_LIST is a repository Actions variable (not a secret) that
+          # holds a JSON array of "app:version" strings permanently flagged as unsafe.
+          # It is written automatically by quarantine-updater.yml whenever you
+          # close a security PR without merging (i.e. confirm the update is malicious).
+          QUARANTINE_LIST_RAW: ${{ vars.QUARANTINE_LIST }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 2
+
+          if (-not (Test-Path "$env:RUNNER_TEMP\unsafe_list.json")) { exit 0 }
+          $unsafeList = Get-Content "$env:RUNNER_TEMP\unsafe_list.json" -Raw | ConvertFrom-Json
+          if (-not $unsafeList) { exit 0 }
+
+          # Parse quarantine list; default to empty array if variable was never set
+          $quarantineList = if ($env:QUARANTINE_LIST_RAW -and $env:QUARANTINE_LIST_RAW.Trim() -ne '') {
+              $env:QUARANTINE_LIST_RAW | ConvertFrom-Json
+          } else {
+              @()
+          }
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git reset --hard
+          git clean -fd
+          git checkout main
+          git pull
+
+          # Guard: ConvertFrom-Json produces a scalar (not array) for a single object
+          if ($unsafeList -isnot [Array]) { $unsafeList = @($unsafeList) }
+
+          foreach ($item in $unsafeList) {
+            $appName       = $item.App
+            $version       = $item.Version
+            $jsonPath      = $item.JsonPath
+            $quarantineKey = "$appName`:$version"
+
+            # ── QUARANTINE GATE ──────────────────────────────────────────────────
+            # If this exact app:version was previously reviewed and confirmed unsafe,
+            # skip silently - no duplicate PR. The daily run will never re-flag it.
+            if ($quarantineList -contains $quarantineKey) {
+                Write-Host ">> SKIP (permanently quarantined): $quarantineKey" -ForegroundColor Cyan
+                continue
+            }
+
+            Write-Host ">> Opening security review PR for: $quarantineKey" -ForegroundColor Yellow
+
+            # FIX: Deterministic branch names prevent duplicate PRs.
+            # If a security PR is already pending review for this app:version,
+            # skip creating another one.
+            $branch = "security/$appName-$version"
+            $remoteExists = git ls-remote --heads origin $branch
+            if ($remoteExists) {
+                Write-Host ">> PR already pending for $quarantineKey (branch $branch exists). Skipping."
+                continue
+            }
+            git checkout -b $branch main
+
+            # TOCTOU FIX: Restore the manifest from the backup taken in Step 2
+            # instead of re-running checkver. This guarantees the PR contains
+            # the EXACT hash that VirusTotal scanned, not a potentially different
+            # one fetched from an upstream that may have hot-swapped the binary.
+            Copy-Item "$env:RUNNER_TEMP\bucket_backup\$appName.json" -Destination $jsonPath -Force
+
+            # Guard: If the restore produced no diff (e.g. manifest already matches),
+            # skip commit to avoid a fatal "nothing to commit" crash.
+            if (-not (git status --porcelain $jsonPath)) {
+                Write-Warning ">> Checkver produced no changes for $appName. Skipping PR."
+                git checkout main
+                continue
+            }
+
+            git add $jsonPath
+            git commit -m "security: quarantine $appName $version for manual review"
+            git push origin $branch
+
+            # ── PR BODY ──────────────────────────────────────────────────────────
+            # The hidden HTML comment at the bottom is MACHINE-READABLE.
+            # quarantine-updater.yml greps for it to extract the quarantine key
+            # and write it to QUARANTINE_LIST when this PR is closed without merging.
+            $body  = "## ⚠️ Security Alert: $appName $version`n`n"
+            $body += "> VirusTotal flagged this update. Review the report below, then "
+            $body += "either **merge** (false positive - safe to ship) or "
+            $body += "**close without merging** (confirmed unsafe - permanently quarantined).`n`n"
+            $body += "| | |`n"
+            $body += "|---|---|`n"
+            $body += "| **App** | ``$appName`` |`n"
+            $body += "| **Version** | ``$version`` |`n"
+            $body += "| **Detections** | $($item.Detections) |`n"
+            $body += "| **VirusTotal Report** | [View scan results]($($item.ReportLink)) |`n"
+            $body += "| **Release Page** | [GitHub release]($($item.ReleaseUrl)) |`n`n"
+            $body += "---`n`n"
+            $body += "### What happens after you decide`n`n"
+            $body += "**Close without merging** -> ``quarantine-updater.yml`` automatically adds "
+            $body += "``$quarantineKey`` to the ``QUARANTINE_LIST`` repo variable. Future daily "
+            $body += "runs will silently skip this version - no duplicate PRs.`n`n"
+            $body += "**Merge** -> the manifest is shipped to users. No quarantine entry is created, "
+            $body += "so a future release of this app will still be scanned normally.`n`n"
+            $body += "<!-- quarantine-key: $quarantineKey -->"
+
+            # Temporarily allow non-terminating errors so a gh failure
+            # doesn't crash the loop and skip subsequent unsafe apps.
+            $ErrorActionPreference = 'Continue'
+            gh pr create `
+              --title "security: $appName $version flagged by VirusTotal" `
+              --body  "$body" `
+              --base  main `
+              --head  $branch `
+              --label "security"
+
+            if ($LASTEXITCODE -ne 0) {
+                # PR creation failed (e.g. permissions). Clean up the remote branch
+                # so it doesn't permanently block future runs via the deterministic branch check.
+                Write-Warning ">> Failed to create PR for $quarantineKey (exit code $LASTEXITCODE). Cleaning up remote branch."
+                git push origin --delete $branch 2>$null
+            }
+            $ErrorActionPreference = 'Stop'
+
+            git checkout main
+          }

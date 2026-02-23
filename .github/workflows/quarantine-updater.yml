@@ -1,0 +1,161 @@
+name: Quarantine Updater
+
+# Fires whenever a pull request targeting main is closed.
+#
+# If the PR came from a security/* branch (a VirusTotal security review PR) AND
+# was NOT merged (meaning you confirmed the update is unsafe), this workflow
+# extracts the "app:version" quarantine key embedded in the PR body and
+# permanently adds it to the QUARANTINE_LIST repository variable.
+#
+# Effect: the daily excavator silently skips that app:version forever.
+# No duplicate security PRs will be opened for the same flagged version.
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+jobs:
+  update-quarantine:
+    name: Update Quarantine List
+    # Run only when:
+    #   1. PR head branch starts with "security/" (it's an excavator-created review PR)
+    #   2. PR was CLOSED without merging (reviewer confirmed it is unsafe)
+    #
+    # If the PR was merged, the update was deemed a false positive and should
+    # NOT be quarantined — users should receive it.
+    if: |
+      startsWith(github.event.pull_request.head.ref, 'security/') &&
+      github.event.pull_request.merged == false &&
+      github.event.pull_request.user.login == 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      # 'actions: write' is required to create or update repository variables
+      # via the REST API. No other permissions are needed.
+      actions: write
+    steps:
+      - name: Extract quarantine key from PR body
+        id: key
+        env:
+          PR_BODY:   ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # The PR body contains a hidden HTML comment in the format:
+          #   <!-- quarantine-key: app-name:1.2.3 -->
+          #
+          # Passing the body through $PR_BODY (env var) instead of inline
+          # ${{ github.event.pull_request.body }} prevents script injection
+          # if the PR body contains characters that would break the shell expression.
+          KEY=$(echo "$PR_BODY" | grep -oP '(?<=<!-- quarantine-key:\s*)\S+?(?=\s*-->)' || true)
+
+          if [ -z "$KEY" ]; then
+            echo "::warning::No quarantine-key comment found in PR #$PR_NUMBER. Was this PR created by excavator.yml? Skipping."
+            exit 0
+          fi
+
+          echo "Quarantine key found: $KEY"
+          echo "quarantine_key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Add key to QUARANTINE_LIST variable
+        if: steps.key.outputs.quarantine_key != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_KEY:  ${{ steps.key.outputs.quarantine_key }}
+          REPO:     ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # ── Step 1: READ current QUARANTINE_LIST ────────────────────────────
+          # If the variable doesn't exist yet, the API returns 404.
+          # We treat that as an empty list and will POST (create) instead of PATCH.
+          HTTP_STATUS=$(curl -s -o /tmp/vt_var.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$REPO/actions/variables/QUARANTINE_LIST")
+
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            CURRENT=$(jq -r '.value' /tmp/vt_var.json)
+            # Validate that the stored value is a valid JSON array.
+            # If it was corrupted or manually set to something invalid, reset gracefully.
+            if ! echo "$CURRENT" | jq -e 'type == "array"' > /dev/null 2>&1; then
+              echo "::warning::QUARANTINE_LIST contained invalid JSON. Resetting to empty array."
+              CURRENT="[]"
+            fi
+            VERB="PATCH"
+          elif [ "$HTTP_STATUS" -eq 404 ]; then
+            echo "QUARANTINE_LIST variable does not exist yet. Will create it."
+            CURRENT="[]"
+            VERB="POST"
+          else
+            echo "::error::Unexpected API response when reading QUARANTINE_LIST: HTTP $HTTP_STATUS"
+            cat /tmp/vt_var.json
+            exit 1
+          fi
+
+          echo "Current QUARANTINE_LIST ($(echo "$CURRENT" | jq 'length') entries): $CURRENT"
+
+          # ── Step 2: IDEMPOTENCY CHECK ────────────────────────────────────────
+          # If the key is already present (e.g. workflow fired twice for the same PR),
+          # skip the write entirely to avoid redundant API calls.
+          ALREADY_EXISTS=$(echo "$CURRENT" | jq --arg key "$NEW_KEY" 'map(select(. == $key)) | length')
+
+          if [ "$ALREADY_EXISTS" -gt 0 ]; then
+            echo "$NEW_KEY is already in QUARANTINE_LIST. Nothing to do."
+            exit 0
+          fi
+
+          # ── Step 3: APPEND and WRITE BACK ───────────────────────────────────
+          UPDATED=$(echo "$CURRENT" | jq --arg key "$NEW_KEY" '. + [$key]')
+          echo "Updated QUARANTINE_LIST ($(echo "$UPDATED" | jq 'length') entries): $UPDATED"
+
+          # GitHub requires the variable value to be a plain string (not a JSON object),
+          # so we serialize the JSON array as a string value.
+          PAYLOAD=$(jq -n --arg name "QUARANTINE_LIST" --arg val "$UPDATED" \
+            '{"name": $name, "value": $val}')
+
+          if [ "$VERB" = "PATCH" ]; then
+            WRITE_STATUS=$(curl -s -o /tmp/write_response.json -w "%{http_code}" \
+              -X PATCH \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPO/actions/variables/QUARANTINE_LIST" \
+              -d "$PAYLOAD")
+          else
+            WRITE_STATUS=$(curl -s -o /tmp/write_response.json -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPO/actions/variables" \
+              -d "$PAYLOAD")
+          fi
+
+          # HTTP 201 (created) and 204 (no content / updated) are both success codes
+          if [ "$WRITE_STATUS" -eq 201 ] || [ "$WRITE_STATUS" -eq 204 ]; then
+            echo "✅ QUARANTINE_LIST updated successfully (HTTP $WRITE_STATUS)."
+          else
+            echo "::error::Failed to write QUARANTINE_LIST: HTTP $WRITE_STATUS"
+            cat /tmp/write_response.json
+            exit 1
+          fi
+
+      - name: Summary
+        if: steps.key.outputs.quarantine_key != ''
+        env:
+          NEW_KEY: ${{ steps.key.outputs.quarantine_key }}
+          PR_NUM:  ${{ github.event.pull_request.number }}
+          PR_URL:  ${{ github.event.pull_request.html_url }}
+        run: |
+          echo "## 🔒 Quarantine Updated" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Quarantined key** | \`$NEW_KEY\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Triggered by** | PR [#$PR_NUM]($PR_URL) (closed without merging) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The daily excavator will **silently skip** \`$NEW_KEY\` from now on." >> "$GITHUB_STEP_SUMMARY"
+          echo "To reverse this decision, manually edit the \`QUARANTINE_LIST\` repository variable." >> "$GITHUB_STEP_SUMMARY"
