@@ -72,11 +72,11 @@ jobs:
 
           $changedFiles = $changed -split "`n" | Where-Object { $_ -match '\.json$' }
 
-          # -AsArray guarantees the output is always a JSON array, even when only
-          # one file changed. Without it, ConvertTo-Json emits a bare string for a
-          # single element, causing ConvertFrom-Json in downstream steps to produce
-          # a scalar instead of a one-item array, breaking foreach iteration.
-          $changedJson = $changedFiles | ConvertTo-Json -Compress -AsArray
+          # Wrapping in @() before passing to ConvertTo-Json guarantees the output
+          # is always a JSON array, even when only one file changed.
+          # NOTE: The -AsArray flag does this in PS 7+, but windows-latest runners
+          # use PowerShell 5.1 where -AsArray does not exist. @() is the PS 5.1 idiom.
+          $changedJson = ConvertTo-Json -InputObject @($changedFiles) -Compress
           echo "changed_files=$changedJson" >> $env:GITHUB_OUTPUT
 
       # 3. Download all changed artifacts and build a metadata map for VT scanning
@@ -299,8 +299,8 @@ jobs:
             }
           }
 
-          # -AsArray: same single-item edge case protection as in Detect Changes
-          $safeJson = $safeFiles | ConvertTo-Json -Compress -AsArray
+          # Same @() idiom as Detect Changes — guarantees a JSON array in PS 5.1.
+          $safeJson = ConvertTo-Json -InputObject @($safeFiles) -Compress
           echo "safe_files=$safeJson" >> $env:GITHUB_OUTPUT
           $unsafeMeta | ConvertTo-Json -Depth 5 | Set-Content "$env:RUNNER_TEMP\unsafe_list.json"
 
