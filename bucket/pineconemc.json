@@ -1,6 +1,6 @@
 {
     "version": "11.0.2",
-    "description": "Custom Minecraft launcher based on PrismLauncher, with Ely.by authentication support (Rebranded to PineconeMC)",
+    "description": "Custom Minecraft launcher based on PrismLauncher, with Ely.by authentication support (PineconeMC)",
     "homepage": "https://github.com/ElyPrismLauncher/Launcher",
     "license": "GPL-3.0-only",
     "url": "https://github.com/ElyPrismLauncher/Launcher/releases/download/11.0.2/PineconeMC-Windows-MSVC-Setup-11.0.2.exe",
@@ -20,11 +20,8 @@
         "url": "https://github.com/ElyPrismLauncher/Launcher/releases/download/$version/$matchName-Windows-MSVC-Setup-$version.exe"
     },
     "notes": [
-        "WARNING: ElyPrismLauncher has been rebranded to PineconeMC.",
-        "This manifest ('ely-prism') is deprecated and will only be maintained until 2027.",
-        "We highly recommend migrating to the new 'pineconemc' package for future updates.",
-        "To migrate, run: scoop uninstall ely-prism && scoop install pineconemc",
-        "",
-        "After install, launch PineconeMC/ElyPrismLauncher from your Start Menu or Desktop shortcut."
+        "PineconeMC uses Ely.by instead of Mojang/Microsoft for authentication.",
+        "A Java runtime is required to play Minecraft. See the 'suggest' entries above.",
+        "After install, launch PineconeMC from your Start Menu or Desktop shortcut."
     ]
 }

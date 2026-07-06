@@ -1,0 +1,27 @@
+{
+    "version": "11.0.3-pre1",
+    "description": "Custom Minecraft launcher based on PrismLauncher, with Ely.by authentication support (PineconeMC Prerelease)",
+    "homepage": "https://github.com/ElyPrismLauncher/Launcher",
+    "license": "GPL-3.0-only",
+    "url": "https://github.com/ElyPrismLauncher/Launcher/releases/download/11.0.3-pre1/PineconeMC-Windows-MSVC-Setup-11.0.3-pre1.exe",
+    "hash": "4a79d757a20f7d45d99f6adf502b34608eeedb072a1c92cc7f3eb662d222bc30",
+    "installer": {
+        "script": [
+            "Start-Process -FilePath \"$dir\\$fname\" -Wait",
+            "Remove-Item \"$dir\\$fname\" -Force"
+        ]
+    },
+    "checkver": {
+        "url": "https://api.github.com/repos/ElyPrismLauncher/Launcher/releases",
+        "jsonpath": "$[?(@.prerelease == true)].assets[*].browser_download_url",
+        "regex": "releases/download/(?:v)?(?<version>[^/]+)/(?<name>[A-Za-z0-9_\\-]+)-Windows-MSVC-Setup-[^/]+\\.exe"
+    },
+    "autoupdate": {
+        "url": "https://github.com/ElyPrismLauncher/Launcher/releases/download/$version/$matchName-Windows-MSVC-Setup-$version.exe"
+    },
+    "notes": [
+        "PineconeMC uses Ely.by instead of Mojang/Microsoft for authentication.",
+        "A Java runtime is required to play Minecraft. See the 'suggest' entries above.",
+        "After install, launch PineconeMC from your Start Menu or Desktop shortcut."
+    ]
+}

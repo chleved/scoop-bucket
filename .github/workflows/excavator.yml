@@ -125,6 +125,9 @@ jobs:
             }
             if ($checkverGithub) {
                 $releaseLink = "$($checkverGithub.TrimEnd('/'))/releases/tag/$($json.version)"
+            } elseif ($json.homepage -match 'https?://github\.com/[^/]+/[^/]+') {
+                $repoUrl = $Matches[0]
+                $releaseLink = "$($repoUrl.TrimEnd('/'))/releases/tag/$($json.version)"
             }
 
             # Collect all download URLs (flat url, and per-architecture).
