@@ -23,6 +23,7 @@
         "WARNING: ElyPrismLauncher has been rebranded to PineconeMC.",
         "This manifest ('ely-prism') is deprecated and will only be maintained until 2027.",
         "We highly recommend migrating to the new 'pineconemc' package for future updates.",
+        "Your settings, instances, and worlds will NOT be lost during this migration.",
         "To migrate, run: scoop uninstall ely-prism && scoop install pineconemc",
         "",
         "After install, launch PineconeMC/ElyPrismLauncher from your Start Menu or Desktop shortcut."
