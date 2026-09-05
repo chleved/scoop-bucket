@@ -1,10 +1,10 @@
 {
-    "version": "3.2.2",
+    "version": "3.3.0",
     "description": "Custom Discord App aiming to give you better performance and improve linux support",
     "homepage": "https://github.com/Equicord/Equibop",
     "license": "GPL-3.0-only",
-    "url": "https://github.com/Equicord/Equibop/releases/download/v3.2.2/Equibop-Setup-3.2.2.exe",
-    "hash": "41bf7515166cefb8c60612b7dbe8f6c2b171bba8da4db5669049519c52a54fd5",
+    "url": "https://github.com/Equicord/Equibop/releases/download/v3.3.0/Equibop-Setup-3.3.0.exe",
+    "hash": "c461c07a2e9b7fbe0d0df1e5f325df9d9aa3315857ac35a75c865a04a5bc562c",
     "installer": {
         "script": [
             "Start-Process -FilePath \"$dir\\$fname\" -Wait",
