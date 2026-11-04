@@ -1,10 +1,10 @@
 {
-    "version": "11.1.1",
+    "version": "11.1.2",
     "description": "Custom Minecraft launcher based on PrismLauncher, with Ely.by authentication support (PineconeMC)",
     "homepage": "https://github.com/ElyPrismLauncher/Launcher",
     "license": "GPL-3.0-only",
-    "url": "https://github.com/ElyPrismLauncher/Launcher/releases/download/11.1.1/PineconeMC-Windows-MSVC-Setup-11.1.1.exe",
-    "hash": "828294fcd8c71c33c307dc7971936a5b8801dd02e32ddc6648e87cb4a92f5562",
+    "url": "https://github.com/ElyPrismLauncher/Launcher/releases/download/11.1.2/PineconeMC-Windows-MSVC-Setup-11.1.2.exe",
+    "hash": "edee94ec8fec0c02efbb1b02d5e4ea5c56eaff4597b02575f577a68df1f9d856",
     "installer": {
         "script": [
             "Start-Process -FilePath \"$dir\\$fname\" -Wait",
